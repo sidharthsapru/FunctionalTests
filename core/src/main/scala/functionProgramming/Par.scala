@@ -26,4 +26,23 @@ object Par {
   }
 
   def map[A,B](a: Par[A])(f: A => B): Par[B] = map2(a,unit(()))((a,_) => f(a))
+
+  def choiceN[A](n: Par[Int])(choices: List[Par[A]]): Par[A] = es => {
+    val p = run(es)(n).get
+    run(es)(choices(p))
+  }
+
+  def chooser[A,B](pa: Par[A])(choices: A => Par[B]): Par[B] = es => {
+    run(es)(choices(run(es)(pa).get))
+  }
+
+  def join[A](a: Par[Par[A]]): Par[A] = es => {
+    val v: Par[A] = run(es)(a).get()
+    run(es)(v)
+  }
+
+  def flatMap[A,B](a: Par[A])(f: A => Par[B]): Par[B] = {
+    join(map(a)(f))
+  }
+
 }
