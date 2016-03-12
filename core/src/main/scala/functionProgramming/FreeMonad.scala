@@ -6,39 +6,30 @@ import scalaz.Free.{await => _, suspend,_}
 import scalaz.\/._
 import scala.language.postfixOps
 import scalaz.concurrent.Task
-
-
-trait Query
-
-case object all extends Query
-
-trait QueryBuilder[A]
+import spray.json._
+import org.bson.types.ObjectId
 
 trait DBRecord[R[_], A] {
-  def id(a: R[A]): String
-  def format(a: R[A]): QueryBuilder[A]
+  def format(a: R[A]): JsonFormat[A]
 }
-
 
 /** A record for updates and retrievals of individual objects of type `A`, keyed on a `String` */
-case class KeyedRecord[A](id: String, key: A => String)(implicit F: QueryBuilder[A]) {
+case class KeyedRecord[A](key: A => ObjectId)(implicit F: JsonFormat[A]) {
   val format = F
 }
-/** List fo Records */
-case class ListRecords[A](id: String)(implicit F: QueryBuilder[A]) {
+/** List of Records */
+case class ListRecords[A](implicit F: JsonFormat[A]) {
   val format = F
 }
 
 object DBRecord {
   /** Creates a keyed resource for objects of type `T` represented as JSON root objects */
   implicit def keyedRecord[T]: DBRecord[KeyedRecord, T] = new DBRecord[KeyedRecord,T] {
-    def id(a: KeyedRecord[T]) = a.id
     def format(a: KeyedRecord[T]) = a.format
   }
 
   /** Creates a list resource for lists of objects of type `T` represented as JSON arrays */
   implicit def listRecord[T]: DBRecord[ListRecords, T] = new DBRecord[ListRecords, T] {
-    def id(a: ListRecords[T]) = a.id
     def format(a: ListRecords[T]) = a.format
   }
 }
@@ -52,7 +43,7 @@ case class Create[I,A](a: I, r: KeyedRecord[I], k: Option[DBError] => A) extends
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
-case class Retrieve[I,A](id: String, r: KeyedRecord[I], k: Option[I] => A) extends CRUD[A] {
+case class Retrieve[I,A](id: ObjectId, r: KeyedRecord[I], k: Option[I] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
@@ -60,14 +51,14 @@ case class Update[I,A](upsert: Boolean, a: I, r: KeyedRecord[I], k: Option[DBErr
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
-case class Delete[I,A](id: String, r: KeyedRecord[I], k:  Option[DBError] => A) extends CRUD[A] {
+case class Delete[I,A](id: ObjectId, r: KeyedRecord[I], k:  Option[DBError] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
 /** A pagination context. The current page elements, with links forwards and back. */
 case class Page[A](bck: Option[String], items: List[A], fwd: Option[String])
 
-case class Paginate[I,A](query: Query,
+case class Paginate[I,A](query: JsValue,
                          r: ListRecords[I],
                          start: Option[String],
                          limit: Option[Int],
@@ -119,23 +110,23 @@ object DB {
       _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
 
   /** Query for a single object by ID */
-  def retreive[A: KeyedRecord](id: String): DB[Option[A]] =
+  def retreive[A: KeyedRecord](id: ObjectId): DB[Option[A]] =
     liftF(Retrieve(id, implicitly[KeyedRecord[A]], (x: Option[A]) => x))
 
   /** Post an update to the given object. */
-  def update[A:KeyedRecord](a: A): DB[Unit] =
-    embed[Option[DBError]](Update(true, a, implicitly[KeyedRecord[A]], _)).flatMap(
+  def update[A:KeyedRecord](a: A, upsert: Boolean = true): DB[Unit] =
+    embed[Option[DBError]](Update(upsert, a, implicitly[KeyedRecord[A]], _)).flatMap(
       _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
 
-  def delete[A: KeyedRecord](id: String): DB[Unit] =
+  def delete[A: KeyedRecord](id: ObjectId): DB[Unit] =
     embed[Option[DBError]](Delete(id, implicitly[KeyedRecord[A]], _)).flatMap(
       _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
 
   /** Query for a single page from a list resource */
-  def getPage[A](query: Query,
+  def getPage[A](query: JsValue,
                  limit: Option[Int] = Some(10),
-                 start: Option[String] = None)(implicit R: ListRecords[A]): DB[Page[A]] =
-    liftF(Paginate(query, R, start, limit, (x: Page[A]) => x))
+                 start: Option[String] = None)(implicit r: ListRecords[A]): DB[Page[A]] =
+    liftF(Paginate(query, r, start, limit, (x: Page[A]) => x))
 
   /** Get the next page given a current page, or None if this is the last page */
   def nextPage[A: ListRecords](p: Page[A]): DB[Option[Page[A]]] =
@@ -149,17 +140,10 @@ object DB {
    * Query for all objects matching the given query.
    * Returns a stream of pages, one page of `limit` results at a time.
    */
-  def getAll[A](query: Query = all,
-                limit: Int = 10)(implicit R: ListRecords[A]): scalaz.stream.Process[DB, List[A]] = {
+  def getAll[A](query: JsValue = JsObject.apply(),
+                limit: Int = 10)(implicit r: ListRecords[A]): scalaz.stream.Process[DB, List[A]] = {
     def emitPage(p: Page[A]): scalaz.stream.Process[DB, List[A]] =
       emit(p.items) ++ p.fwd.map(_ => await(nextPage(p))(_.map(emitPage).getOrElse(halt))).getOrElse(halt)
-    await(getPage(query, Some(limit)))(emitPage)
-  }
-
-  def getSinglePage[A](query: Query = all,
-                       limit: Int = 10)(implicit R: ListRecords[A]): scalaz.stream.Process[DB, List[A]] = {
-    def emitPage(p: Page[A]): scalaz.stream.Process[DB, List[A]] =
-      emit(p.items) ++ halt
     await(getPage(query, Some(limit)))(emitPage)
   }
 
