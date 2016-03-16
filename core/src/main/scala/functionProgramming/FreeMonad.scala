@@ -1,88 +1,81 @@
 package DB
-
-import scalaz._
-import scalaz.stream.Process.{Get => _}
-import scalaz.Free.{await => _, suspend,_}
+import scalaz.stream.Process.{Get => _, _}
+import scalaz.Free.{await => _}
+import scalaz.syntax.traverse._
 import scalaz.\/._
+import scalaz.stream.Process.{Get => _}
+import scalaz.Free.{await => _,_}
 import scala.language.postfixOps
 import scalaz.concurrent.Task
-import spray.json._
 import org.bson.types.ObjectId
+import scalaz._
+import scalaz.stream._
+import spray.json._
+import scala.Some
 
-trait DBRecord[R[_], A] {
+trait DBResource[R[_], A] {
   def format(a: R[A]): JsonFormat[A]
 }
 
-/** A record for updates and retrievals of individual objects of type `A`, keyed on a `String` */
-case class KeyedRecord[A](key: A => ObjectId)(implicit F: JsonFormat[A]) {
-  val format = F
-}
-/** List of Records */
-case class ListRecords[A](implicit F: JsonFormat[A]) {
+/** A resource for updates and retrievals of individual objects of type `A`, keyed on a `ObjectId` */
+case class KeyedResource[A](key: A => ObjectId)(implicit F: RootJsonFormat[A]) {
   val format = F
 }
 
-object DBRecord {
+/** A resource for retrievals of lists and pages of objects of type `A` */
+case class ListResource[A](implicit F: JsonFormat[A]) {
+  val format = F
+}
+
+object Resource {
   /** Creates a keyed resource for objects of type `T` represented as JSON root objects */
-  implicit def keyedRecord[T]: DBRecord[KeyedRecord, T] = new DBRecord[KeyedRecord,T] {
-    def format(a: KeyedRecord[T]) = a.format
+  implicit def keyedJsonResource[T]: DBResource[KeyedResource, T] = new DBResource[KeyedResource, T] {
+    def format(a: KeyedResource[T]) = a.format
+
   }
 
   /** Creates a list resource for lists of objects of type `T` represented as JSON arrays */
-  implicit def listRecord[T]: DBRecord[ListRecords, T] = new DBRecord[ListRecords, T] {
-    def format(a: ListRecords[T]) = a.format
+  implicit def listJsonResource[T]: DBResource[ListResource, T] = new DBResource[ListResource, T] {
+    def format(a: ListResource[T]) = a.format
   }
 }
 
-/** The algebra of CRUD operations */
 sealed trait CRUD[+A] {
   def map[B](f: A => B): CRUD[B]
 }
 
-case class Create[I,A](a: I, r: KeyedRecord[I], k: Option[DBError] => A) extends CRUD[A] {
-  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
+case class Retrieve[I,A](query: JsValue, r: KeyedResource[I], k: Option[I] => A) extends CRUD[A] {
+  def map[B](f: A => B): CRUD[B] = copy(k = k andThen  f)
 }
 
-case class Retrieve[I,A](id: ObjectId, r: KeyedRecord[I], k: Option[I] => A) extends CRUD[A] {
-  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
-}
-
-case class Update[I,A](upsert: Boolean, a: I, r: KeyedRecord[I], k: Option[DBError] => A) extends CRUD[A] {
-  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
-}
-
-case class Delete[I,A](id: ObjectId, r: KeyedRecord[I], k:  Option[DBError] => A) extends CRUD[A] {
-  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
-}
-
-/** A pagination context. The current page elements, with links forwards and back. */
-case class Page[A](bck: Option[String], items: List[A], fwd: Option[String])
+case class Page[A](bck: Option[ObjectId], items: List[A], fwd: Option[ObjectId])
 
 case class Paginate[I,A](query: JsValue,
-                         r: ListRecords[I],
-                         start: Option[String],
+                         r: ListResource[I],
                          limit: Option[Int],
+                         start: Option[ObjectId],
                          k: Page[I] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
-
-case class NextPage[I,A](p: Page[I],
-                         r: ListRecords[I],
+case class NextPage[I,A](p: Page[I],r: ListResource[I],
+                         k: Option[Page[I]] => A) extends CRUD[A] {
+  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
+}
+case class PrevPage[I,A](p: Page[I],r: ListResource[I],
                          k: Option[Page[I]] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
-case class PrevPage[I,A](p: Page[I],
-                         r: ListRecords[I],
-                         k: Option[Page[I]] => A) extends CRUD[A] {
+case class WriteOne[I,A](upsert: Boolean, a: I, r: KeyedResource[I], k: Option[RestError] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
-case class ErrorOp[A](err: DBError) extends CRUD[A] {
+case class ErrorOp[A](err: RestError) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = ErrorOp(err)
 }
 
-case class DBError(msg: String)
+case class RestError(msg: String)
+
 
 object CRUD {
   implicit val DbOpFunctor: Functor[CRUD] = new Functor[CRUD] {
@@ -91,86 +84,79 @@ object CRUD {
 }
 
 object DB {
-  import scalaz.stream.Process._
 
   type DB[A] = Free[CRUD, A]
 
   /** Wrap a value in `DB`. Monadic unit for the `DB` monad. */
   def apply[A](a: A): DB[A] = point[CRUD,A](a)
 
+  /** Query for an object */
+  def retrieve[A: KeyedResource](query: JsValue): DB[Option[A]] =
+    liftF(Retrieve(query, implicitly[KeyedResource[A]], (x: Option[A]) => x))
 
-  private def embed[A](k: (A => DB[A]) => CRUD[DB[A]]): DB[A] =
-    liftF(k(point(_))).flatMap(identity)
-
-  /// Public API ///
-
-  /** Create. */
-  def create[A:KeyedRecord](a: A): DB[Unit] =
-    embed[Option[DBError]](Create(a, implicitly[KeyedRecord[A]], _)).flatMap(
-      _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
-
-  /** Query for a single object by ID */
-  def retreive[A: KeyedRecord](id: ObjectId): DB[Option[A]] =
-    liftF(Retrieve(id, implicitly[KeyedRecord[A]], (x: Option[A]) => x))
-
-  /** Post an update to the given object. */
-  def update[A:KeyedRecord](a: A, upsert: Boolean = true): DB[Unit] =
-    embed[Option[DBError]](Update(upsert, a, implicitly[KeyedRecord[A]], _)).flatMap(
-      _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
-
-  def delete[A: KeyedRecord](id: ObjectId): DB[Unit] =
-    embed[Option[DBError]](Delete(id, implicitly[KeyedRecord[A]], _)).flatMap(
-      _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
 
   /** Query for a single page from a list resource */
-  def getPage[A](query: JsValue,
+  def getPage[A: ListResource](query: JsValue,
                  limit: Option[Int] = Some(10),
-                 start: Option[String] = None)(implicit r: ListRecords[A]): DB[Page[A]] =
-    liftF(Paginate(query, r, start, limit, (x: Page[A]) => x))
+                 start: Option[ObjectId] = None): DB[Page[A]] =
+    liftF(Paginate(query,implicitly[ListResource[A]],limit,start, (x: Page[A]) => x))
 
   /** Get the next page given a current page, or None if this is the last page */
-  def nextPage[A: ListRecords](p: Page[A]): DB[Option[Page[A]]] =
-    liftF(NextPage(p, implicitly[ListRecords[A]], (x: Option[Page[A]]) => x))
+  def nextPage[A: ListResource](p: Page[A]): DB[Option[Page[A]]] =
+    liftF(NextPage(p,implicitly[ListResource[A]],(x: Option[Page[A]]) => x))
 
   /** Get the previous page given a current page or None if this is the first page */
-  def prevPage[A: ListRecords](p: Page[A]): DB[Option[Page[A]]] =
-    liftF(PrevPage(p, implicitly[ListRecords[A]], (x: Option[Page[A]]) => x))
+  def prevPage[A: ListResource](p: Page[A]): DB[Option[Page[A]]] =
+    liftF(PrevPage(p,implicitly[ListResource[A]],(x: Option[Page[A]]) => x))
 
   /**
    * Query for all objects matching the given query.
    * Returns a stream of pages, one page of `limit` results at a time.
    */
-  def getAll[A](query: JsValue = JsObject.apply(),
-                limit: Int = 10)(implicit r: ListRecords[A]): scalaz.stream.Process[DB, List[A]] = {
-    def emitPage(p: Page[A]): scalaz.stream.Process[DB, List[A]] =
+  def getAll[A](query: JsValue = JsObject(),limit: Int = 10)(implicit R: ListResource[A]): Process[DB, List[A]] = {
+    def emitPage(p: Page[A]): Process[DB, List[A]] =
       emit(p.items) ++ p.fwd.map(_ => await(nextPage(p))(_.map(emitPage).getOrElse(halt))).getOrElse(halt)
     await(getPage(query, Some(limit)))(emitPage)
   }
 
+
+  private def embed[A](k: (A => DB[A]) => CRUD[DB[A]]): DB[A] =
+    liftF(k(point(_))).flatMap(identity)
+
+  /** Post an update to the given object. */
+  def update[A:KeyedResource](a: A): DB[Unit] =
+    embed[Option[RestError]](WriteOne(true, a, implicitly[KeyedResource[A]], _)).flatMap(
+      _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
+
+  /** Create or replace the given object. */
+  def create[A:KeyedResource](a: A): DB[Unit] =
+    embed[Option[RestError]](WriteOne(false, a, implicitly[KeyedResource[A]], _)).flatMap(
+      _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
+
   /** A DB operation that always fails with the given error */
-  def error[A](msg: String): DB[A] = liftF(ErrorOp(DBError(msg)))
+  def error[A](msg: String): DB[A] = liftF(ErrorOp(RestError(msg)))
 
   /** If the operation terminates in an error, catch that error and return it as a value. */
-  def attempt[A](r: DB[A]): DB[DBError \/ A] = r.resume.fold({
+  def attempt[A](r: DB[A]): DB[RestError \/ A] = r.resume.fold({
     case ErrorOp(e) => point(left(e))
     case s => liftF(s) flatMap attempt
   }, a => point(right(a)))
+
+
 }
 
-class TestDB {
+trait Repository {
   import DB._
+
+
+  def op[A](c: CRUD[A]): Task[A]
 
   private val step: CRUD ~> Task = new (CRUD ~> Task) {
     def apply[A](c: CRUD[A]) = op(c)
   }
 
-
-  /** Lifts a stream of `A` in `DB` to a stream of `A` in `Task` */
-  def process[A](p: scalaz.stream.Process[DB, A]): scalaz.stream.Process[Task, A] =
-    p.translate(trans)
-
   /** A natural transformation from `DBAction` to `Task` */
-  val trans: DB ~> Task = new (DB ~> Task) {
+  private val trans: DB ~> Task = new (DB ~> Task) {
     def apply[A](c: DB[A]) = run(c)
   }
 
@@ -178,25 +164,5 @@ class TestDB {
   /** Turn the `DB` script into a `Task` that executes a set of DB requests when run. */
   def run[A](action: DB[A]): Task[A] =
     action.foldMap(step)
-
-  /** An interpreter of `DB` actions into `Task` actions that perform DB Actions when run. */
-  private def op[A](c: CRUD[A]): Task[A] = {
-    c match {
-      case Create(a, r, k) => sys.error("Not Implemented Yet")
-
-      case Retrieve(id, r, k) =>  sys.error("Not Implemented Yet")
-
-      case Update(u,id,r,k) => sys.error("Not Implemented Yet")
-
-      case Delete(id,r,k) => sys.error("Not Implemented Yet")
-
-      case Paginate(q, r, start, limit, k) => sys.error("Not implement yet")
-
-      case NextPage(p, r, k) => sys.error("Not implement yet")
-
-      case PrevPage(p, r, k) => sys.error("Not implement yet")
-
-      case ErrorOp(e) => Task.fail(new Exception(e.msg))
-    }
-  }
 }
+
