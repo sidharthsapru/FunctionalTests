@@ -1,17 +1,4 @@
 package DB
-import scalaz.stream.Process.{Get => _, _}
-import scalaz.Free.{await => _}
-import scalaz.syntax.traverse._
-import scalaz.\/._
-import scalaz.stream.Process.{Get => _}
-import scalaz.Free.{await => _,_}
-import scala.language.postfixOps
-import scalaz.concurrent.Task
-import org.bson.types.ObjectId
-import scalaz._
-import scalaz.stream._
-import spray.json._
-import scala.Some
 
 trait DBResource[R[_], A] {
   def format(a: R[A]): JsonFormat[A]
@@ -48,7 +35,7 @@ case class Retrieve[I,A](query: JsValue, r: KeyedResource[I], k: Option[I] => A)
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen  f)
 }
 
-case class Page[A](bck: Option[ObjectId], items: List[A], fwd: Option[ObjectId])
+case class Page[A](bck: Option[ObjectId], items: List[A], fwd: Option[ObjectId], query: JsValue, limit: Option[Int])
 
 case class Paginate[I,A](query: JsValue,
                          r: ListResource[I],
@@ -57,25 +44,30 @@ case class Paginate[I,A](query: JsValue,
                          k: Page[I] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
-case class NextPage[I,A](p: Page[I],r: ListResource[I],
-                         k: Option[Page[I]] => A) extends CRUD[A] {
-  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
-}
-case class PrevPage[I,A](p: Page[I],r: ListResource[I],
+
+case class NextPage[I,A](query: JsValue, r: ListResource[I], start:Option[ObjectId], limit: Option[Int],
                          k: Option[Page[I]] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
-case class WriteOne[I,A](upsert: Boolean, a: I, r: KeyedResource[I], k: Option[RestError] => A) extends CRUD[A] {
+case class PrevPage[I,A](query: JsValue,r: ListResource[I], start:Option[ObjectId], limit: Option[Int],
+                         k: Option[Page[I]] => A) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
 }
 
-case class ErrorOp[A](err: RestError) extends CRUD[A] {
+case class WriteOne[I,A](upsert: Boolean, a: I, r: KeyedResource[I], k: Option[DBError] => A) extends CRUD[A] {
+  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
+}
+
+case class UpdateOne[I,A](query: JsValue, a: I, r: KeyedResource[I], k: Option[DBError] => A) extends CRUD[A] {
+  def map[B](f: A => B): CRUD[B] = copy(k = k andThen f)
+}
+
+case class ErrorOp[A](err: DBError) extends CRUD[A] {
   def map[B](f: A => B): CRUD[B] = ErrorOp(err)
 }
 
-case class RestError(msg: String)
-
+case class DBError(msg: String)
 
 object CRUD {
   implicit val DbOpFunctor: Functor[CRUD] = new Functor[CRUD] {
@@ -103,11 +95,11 @@ object DB {
 
   /** Get the next page given a current page, or None if this is the last page */
   def nextPage[A: ListResource](p: Page[A]): DB[Option[Page[A]]] =
-    liftF(NextPage(p,implicitly[ListResource[A]],(x: Option[Page[A]]) => x))
+    liftF(NextPage(p.query,implicitly[ListResource[A]],p.fwd, p.limit,(x: Option[Page[A]]) => x))
 
   /** Get the previous page given a current page or None if this is the first page */
   def prevPage[A: ListResource](p: Page[A]): DB[Option[Page[A]]] =
-    liftF(PrevPage(p,implicitly[ListResource[A]],(x: Option[Page[A]]) => x))
+    liftF(PrevPage(p.query,implicitly[ListResource[A]],p.bck, p.limit,(x: Option[Page[A]]) => x))
 
   /**
    * Query for all objects matching the given query.
@@ -125,19 +117,25 @@ object DB {
 
   /** Post an update to the given object. */
   def update[A:KeyedResource](a: A): DB[Unit] =
-    embed[Option[RestError]](WriteOne(true, a, implicitly[KeyedResource[A]], _)).flatMap(
+    embed[Option[DBError]](WriteOne(true, a, implicitly[KeyedResource[A]], _)).flatMap(
       _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
+
+  /** Find and Modify a given object. */
+  def updateOne[A:KeyedResource](query: JsValue, a: A): DB[Unit] =
+    embed[Option[DBError]](UpdateOne(query,a, implicitly[KeyedResource[A]], _)).flatMap(
+      _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
+
 
   /** Create or replace the given object. */
   def create[A:KeyedResource](a: A): DB[Unit] =
-    embed[Option[RestError]](WriteOne(false, a, implicitly[KeyedResource[A]], _)).flatMap(
+    embed[Option[DBError]](WriteOne(false, a, implicitly[KeyedResource[A]], _)).flatMap(
       _.map(e => error[Unit](e.msg)).getOrElse(DB(())))
 
   /** A DB operation that always fails with the given error */
-  def error[A](msg: String): DB[A] = liftF(ErrorOp(RestError(msg)))
+  def error[A](msg: String): DB[A] = liftF(ErrorOp(DBError(msg)))
 
   /** If the operation terminates in an error, catch that error and return it as a value. */
-  def attempt[A](r: DB[A]): DB[RestError \/ A] = r.resume.fold({
+  def attempt[A](r: DB[A]): DB[DBError \/ A] = r.resume.fold({
     case ErrorOp(e) => point(left(e))
     case s => liftF(s) flatMap attempt
   }, a => point(right(a)))
@@ -165,4 +163,3 @@ trait Repository {
   def run[A](action: DB[A]): Task[A] =
     action.foldMap(step)
 }
-
